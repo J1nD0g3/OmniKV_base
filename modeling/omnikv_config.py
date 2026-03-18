@@ -1,5 +1,6 @@
 import torch
 from transformers.models.llama.modeling_llama import *
+from transformers import LlamaConfig
 from tiny_tools.log import logger
 
 _CONFIG_FOR_DOC = "LlamaConfig"

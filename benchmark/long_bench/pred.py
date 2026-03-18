@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import datetime
 from tqdm import tqdm
 import numpy as np
 import random
@@ -10,6 +12,7 @@ from torch.multiprocessing import Process
 import torch
 from transformers import AutoTokenizer, LlamaTokenizer, LlamaForCausalLM, AutoModelForCausalLM, GenerationConfig
 import torch.distributed as dist
+import infer as infer_module
 from infer import get_any_chat_api
 from tiny_tools.tensor_tools import idx_tracer
 
@@ -25,6 +28,7 @@ def parse_args(args=None):
     parser.add_argument("--ws", default=2, type=int, help='world size')
     parser.add_argument("--task_start_id", default=0, type=int)
     parser.add_argument("--task", default=None, type=str)
+    parser.add_argument("--n", default=0, type=int, help="Number of samples to use (0 for all)")
     return parser.parse_args(args)
 
 
@@ -145,9 +149,14 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
             pred = output
 
         pred = post_process(pred, model_name)
+        # Collect per-sample inference metadata
+        meta = infer_module.last_inference_meta.copy()
         with open(out_path, "a", encoding="utf-8") as f:
             json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"],
-                       "length": json_obj["length"]}, f, ensure_ascii=False)
+                       "length": json_obj["length"],
+                       "input_len": meta.get("input_len"),
+                       "output_len": meta.get("output_len"),
+                       "num_selected_kv": meta.get("num_selected_kv")}, f, ensure_ascii=False)
             f.write('\n')
 
         # 用来分析模型性质的code:::
@@ -252,11 +261,20 @@ if __name__ == '__main__':
     # feel free to modify them to optimize model output
     dataset2prompt = json.load(open("benchmark/long_bench/config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("benchmark/long_bench/config/dataset2maxlen.json", "r"))
-    # predict on each dataset
-    # if not os.path.exists("pred"):
-    #     os.makedirs("pred")
-    # if not os.path.exists("pred_e"):
-    #     os.makedirs("pred_e")
+
+    # Increase max_gen when thinking mode is enabled
+    enable_thinking = d_cfg.get("enable_thinking", False)
+    thinking_extra_tokens = d_cfg.get("thinking_extra_tokens", 4096)
+    if enable_thinking:
+        print(f"[Thinking ON] Adding {thinking_extra_tokens} extra tokens to max_gen for each dataset")
+        dataset2maxlen = {k: v + thinking_extra_tokens for k, v in dataset2maxlen.items()}
+
+    # Track experiment timing and memory
+    exp_start_time = time.time()
+    gpu_mem_before = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+    torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
+    per_dataset_stats = {}
+
     base_path = ''
     if os.environ.get("NO_NAS", False):
         base_path = '/jitai/'
@@ -276,27 +294,191 @@ if __name__ == '__main__':
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
         data_all = [data_sample for data_sample in data]
+        if args.n > 0:
+            data_all = data_all[:args.n]
         # data_subsets = [data_all[i::world_size] for i in range(world_size)]
         processes = []
         torch.cuda.empty_cache()
+        ds_start = time.time()
         get_pred(0, world_size, data_all, max_length,
                  max_gen, prompt_format, dataset, None, model_name, model2path,
                  out_path, args)
-        # 去掉多进程
-        # for rank in range(world_size):
-        #     # if d_cfg.get('use_multi_gpus', False):
-        #     #     p = CustomProcess(target=get_pred,
-        #     #                       args=(rank, world_size, data_subsets[rank], max_length,
-        #     #                             max_gen, prompt_format, dataset, None, model_name, model2path,
-        #     #                             out_path, args),
-        #     #                       env_var_key="CUDA_VISIBLE_DEVICES",
-        #     #                       env_var_value=f"{rank % torch.cuda.device_count()}")
-        #     # else:
-        #     #     p = mp.Process(target=get_pred, args=(rank, world_size, data_subsets[rank], max_length,
-        #     #                                           max_gen, prompt_format, dataset, None, model_name, model2path,
-        #     #                                           out_path, args))
-        #
-        #     p.start()
-        #     processes.append(p)
-        # for p in processes:
-        #     p.join()
+        ds_elapsed = time.time() - ds_start
+        ds_peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0
+        per_dataset_stats[dataset] = {
+            "num_samples": len(data_all),
+            "elapsed_time_s": round(ds_elapsed, 2),
+            "peak_gpu_memory_gb": round(ds_peak_mem, 2),
+        }
+    # ===== Run evaluation and generate experiment log =====
+    exp_total_time = time.time() - exp_start_time
+    peak_gpu_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0
+
+    # Run evaluation (inline, same logic as eval.py)
+    from metrics import (
+        qa_f1_score, rouge_zh_score, qa_f1_zh_score, rouge_score,
+        classification_score, retrieval_score, retrieval_zh_score,
+        count_score, code_sim_score,
+    )
+    _dataset2metric = {
+        "narrativeqa": qa_f1_score, "qasper": qa_f1_score,
+        "multifieldqa_en": qa_f1_score, "multifieldqa_zh": qa_f1_zh_score,
+        "hotpotqa": qa_f1_score, "2wikimqa": qa_f1_score, "musique": qa_f1_score,
+        "dureader": rouge_zh_score, "gov_report": rouge_score, "qmsum": rouge_score,
+        "multi_news": rouge_score, "vcsum": rouge_zh_score,
+        "trec": classification_score, "triviaqa": qa_f1_score, "samsum": rouge_score,
+        "lsht": classification_score, "passage_retrieval_en": retrieval_score,
+        "passage_count": count_score, "passage_retrieval_zh": retrieval_zh_score,
+        "lcc": code_sim_score, "repobench-p": code_sim_score,
+    }
+
+    if args.e:
+        pred_dir = f"{base_path}benchmark/long_bench/pred_e/{model_name}/{args.cfg}"
+    else:
+        pred_dir = f"{base_path}benchmark/long_bench/pred/{model_name}/{args.cfg}"
+
+    scores = {}
+    sample_details = {}  # per-dataset list of {input_len, output_len, num_selected_kv}
+    for filename in os.listdir(pred_dir):
+        if not filename.endswith("jsonl"):
+            continue
+        ds_name = filename.split('.')[0]
+        predictions, answers = [], []
+        ds_details = []
+        with open(f"{pred_dir}/{filename}", "r", encoding="utf-8") as f:
+            for line in f:
+                data = json.loads(line)
+                predictions.append(data["pred"])
+                answers.append(data["answers"])
+                all_classes = data["all_classes"]
+                ds_details.append({
+                    "input_len": data.get("input_len"),
+                    "output_len": data.get("output_len"),
+                    "num_selected_kv": data.get("num_selected_kv"),
+                })
+        sample_details[ds_name] = ds_details
+        if not predictions:
+            continue
+        try:
+            total_score = 0.
+            for pred_text, ground_truths in zip(predictions, answers):
+                s = 0.
+                if ds_name in ["trec", "triviaqa", "samsum", "lsht"]:
+                    pred_text = pred_text.lstrip('\n').split('\n')[0]
+                for gt in ground_truths:
+                    s = max(s, _dataset2metric[ds_name](pred_text, gt, all_classes=all_classes))
+                total_score += s
+            scores[ds_name] = round(100 * total_score / len(predictions), 2)
+        except Exception as e:
+            print(f"eval error in {ds_name}: {e}")
+
+    # Save result.json
+    result_path = f"{pred_dir}/result.json"
+    with open(result_path, "w") as f:
+        json.dump(scores, f, ensure_ascii=False, indent=4)
+    print(f"Scores: {scores}")
+
+    # Compute KV cache ratio
+    _do_sel = [int(i) for i in d_cfg.get("do_select_layers", "0").split(",")]
+    _nwait = d_cfg.get("num_wait_load_layers", 2)
+    _token_ratio = d_cfg.get("num_of_selected_tokens", 4096)
+    _num_layers = None
+    # Try to get num_hidden_layers from model config
+    model_cfg_path = os.path.join(d_cfg["model_name"], "config.json")
+    if os.path.exists(model_cfg_path):
+        with open(model_cfg_path) as f:
+            _num_layers = json.load(f).get("num_hidden_layers")
+    kv_cache_info = {}
+    if _num_layers and isinstance(_token_ratio, float):
+        _full_attn = list(range(0, _do_sel[0])) + _do_sel + [_num_layers]
+        _nf, _ns = 0, 0
+        for _l in _full_attn:
+            _r = _num_layers
+            for _i in range(_l + 1, _num_layers + 1):
+                if _i in _full_attn:
+                    _r = _i
+                    break
+            _nf += min(_r, _l + _nwait + 1) - _l
+            _ns += max(0, _r - min(_r, _l + _nwait + 1))
+        overall_ratio = (_nf * 1.0 + _ns * _token_ratio) / _num_layers
+        kv_cache_info = {
+            "per_layer_token_ratio": _token_ratio,
+            "full_cache_layers": _nf,
+            "sparse_cache_layers": _ns,
+            "total_layers": _num_layers,
+            "overall_kv_cache_ratio": round(overall_ratio, 4),
+        }
+
+    # GPU info
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+
+    # Summarize per-dataset sample details (input_len, output_len, num_selected_kv)
+    inference_stats = {}
+    for ds_name, details in sample_details.items():
+        input_lens = [d["input_len"] for d in details if d.get("input_len") is not None]
+        output_lens = [d["output_len"] for d in details if d.get("output_len") is not None]
+        selected_kvs = [d["num_selected_kv"] for d in details if d.get("num_selected_kv") is not None]
+        stat = {}
+        if input_lens:
+            stat["input_len"] = {"mean": round(np.mean(input_lens), 1), "min": min(input_lens), "max": max(input_lens)}
+        if output_lens:
+            stat["output_len"] = {"mean": round(np.mean(output_lens), 1), "min": min(output_lens), "max": max(output_lens)}
+        if selected_kvs:
+            stat["num_selected_kv"] = {"mean": round(np.mean(selected_kvs), 1), "min": min(selected_kvs), "max": max(selected_kvs)}
+        if input_lens and selected_kvs:
+            ratios = [s / i for s, i in zip(selected_kvs, input_lens) if i > 0]
+            stat["actual_kv_select_ratio"] = {"mean": round(np.mean(ratios), 4), "min": round(min(ratios), 4), "max": round(max(ratios), 4)}
+        stat["samples"] = details
+        inference_stats[ds_name] = stat
+
+    # Build experiment log
+    exp_log = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "config_path": args.cfg,
+        "model_name": d_cfg.get("model_name", "unknown"),
+        "model_cls": d_cfg.get("model_cls", "unknown"),
+        "enable_thinking": enable_thinking,
+        "num_samples_per_dataset": args.n if args.n > 0 else "all",
+        "max_context_len": d_cfg.get("max_context_len", -1),
+        "kv_cache": kv_cache_info,
+        "scores": scores,
+        "avg_score": round(np.mean(list(scores.values())), 2) if scores else 0,
+        "per_dataset_stats": per_dataset_stats,
+        "inference_stats": inference_stats,
+        "total_elapsed_time_s": round(exp_total_time, 2),
+        "peak_gpu_memory_gb": round(peak_gpu_mem, 2),
+        "gpu": gpu_name,
+        "datasets_evaluated": list(scores.keys()),
+    }
+
+    # Save log file
+    log_dir = f"{pred_dir}"
+    log_filename = f"experiment_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    log_path = os.path.join(log_dir, log_filename)
+    with open(log_path, "w") as f:
+        json.dump(exp_log, f, ensure_ascii=False, indent=4)
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"Experiment Summary")
+    print(f"{'='*60}")
+    print(f"  Model:            {d_cfg.get('model_name', 'unknown')}")
+    print(f"  Thinking:         {'ON' if enable_thinking else 'OFF'}")
+    print(f"  Datasets:         {list(scores.keys())}")
+    print(f"  Avg Score:        {exp_log['avg_score']}")
+    print(f"  Total Time:       {exp_total_time:.1f}s")
+    print(f"  Peak GPU Memory:  {peak_gpu_mem:.2f} GB")
+    print(f"  GPU:              {gpu_name}")
+    if kv_cache_info:
+        print(f"  KV Cache Ratio:   {kv_cache_info['overall_kv_cache_ratio']*100:.2f}% "
+              f"(per-layer: {kv_cache_info['per_layer_token_ratio']*100:.2f}%, "
+              f"full: {kv_cache_info['full_cache_layers']}, sparse: {kv_cache_info['sparse_cache_layers']})")
+    print(f"  Scores:           {scores}")
+    for ds_name, stat in inference_stats.items():
+        if "input_len" in stat and "num_selected_kv" in stat:
+            print(f"  [{ds_name}] input_len: {stat['input_len']}, "
+                  f"output_len: {stat.get('output_len', 'N/A')}, "
+                  f"selected_kv: {stat['num_selected_kv']}, "
+                  f"actual_ratio: {stat.get('actual_kv_select_ratio', 'N/A')}")
+    print(f"  Log saved to:     {log_path}")
+    print(f"{'='*60}")

@@ -72,3 +72,8 @@ results/
 output/
 trained_models/
 cached_files/
+
+benchmark/long_bench/pred/
+benchmark/long_bench/data/
+benchmark/math500/pred/
+benchmark/math500/data/

@@ -19,6 +19,9 @@ from torch.cuda.amp import autocast
 from argparse import ArgumentParser
 from tiny_tools.tensor_tools import idx_tracer
 
+# Per-sample inference metadata, updated after each inference_bs1 call
+last_inference_meta = {}
+
 if transformers.__version__ >= "4.40":
     from transformers import (
         BitsAndBytesConfig,
@@ -31,6 +34,7 @@ if transformers.__version__ >= "4.40":
     from modeling.omnikv import OmniKVMulLM
     from modeling.brutal_offload_llama import BrutalOffloadLM
     from modeling.omnikv_config import LlamaCompressorConfig
+    from modeling.qwen3_omnikv import Qwen3OmniKVMulLM, Qwen3CompressorConfig
     from configs.template_for_chat import get_chat_template
     from baselines.infllm import get_infllm_api
 
@@ -80,7 +84,8 @@ def inference_bs1(
                 if eos_token in tkn.vocab:
                     terminators += [tkn.convert_tokens_to_ids(eos_token)]
             if use_chat_template:
-                template = get_chat_template(model_name, use_cot)
+                enable_thinking = kwargs.pop("enable_thinking", None)
+                template = get_chat_template(model_name, use_cot, enable_thinking=enable_thinking)
                 prompt = template.format(
                     user_message=prompt, system_prompt="You are a helpful assistant."
                 )
@@ -97,6 +102,8 @@ def inference_bs1(
                 eos_token_id=terminators,
                 **kwargs,
             )[:, n:]
+            last_inference_meta["input_len"] = n
+            last_inference_meta["output_len"] = temp.shape[1]
             if os.environ.get("USE_TIMER", False):
                 print(f"-------inference_bs1 time {round(time.time() - st, 4)} s")
             return temp
@@ -193,8 +200,12 @@ def get_token_select_llama_chat_api_with_tokenizer_bs1(config_path):
     config = read_config(config_path)
     cls = config.get("model_cls", "token")
     model_name = config["model_name"]
+    is_qwen3 = config.get("model_arch", "") == "qwen3"
 
-    cfg_cls = TokenConfig
+    if is_qwen3:
+        cfg_cls = Qwen3CompressorConfig
+    else:
+        cfg_cls = TokenConfig
     cfg = read_config(config_path)
     config = cfg_cls.from_pretrained(model_name)
     config.set_config(**cfg)
@@ -234,12 +245,46 @@ def get_token_select_llama_chat_api_with_tokenizer_bs1(config_path):
     elif cls == "brutal_offload":
         model = BrutalOffloadLM.from_pretrained(*args, **kwargs)
     elif cls == "multi":
-        model = OmniKVMulLM.from_pretrained(*args, **kwargs)
+        if is_qwen3:
+            model = Qwen3OmniKVMulLM.from_pretrained(*args, **kwargs)
+        else:
+            model = OmniKVMulLM.from_pretrained(*args, **kwargs)
     else:
         raise ValueError
 
     if not load_in_8bit and not load_in_4bit:
         model = model.cuda(device)
+
+    # Log KV cache ratio information
+    _do_sel_layers = [int(i) for i in config.get("do_select_layers", "").split(",")]
+    _num_wait = config.get("num_wait_load_layers", 2)
+    _num_layers = config.num_hidden_layers
+    _token_ratio = config.get("num_of_selected_tokens", 4096)
+    _full_attn_layers = list(range(0, _do_sel_layers[0])) + _do_sel_layers + [_num_layers]
+    _num_full, _num_sparse = 0, 0
+    for _l in _full_attn_layers:
+        _r = _num_layers
+        for _i in range(_l + 1, _num_layers + 1):
+            if _i in _full_attn_layers:
+                _r = _i
+                break
+        _num_full += min(_r, _l + _num_wait + 1) - _l
+        _num_sparse += max(0, _r - min(_r, _l + _num_wait + 1))
+    if isinstance(_token_ratio, float):
+        _overall_ratio = (_num_full * 1.0 + _num_sparse * _token_ratio) / _num_layers
+        logger.info(
+            f"[KV Cache Info] per-layer token selection ratio: {_token_ratio:.4f} "
+            f"({_token_ratio*100:.2f}%), "
+            f"full cache layers: {_num_full}/{_num_layers}, "
+            f"sparse cache layers: {_num_sparse}/{_num_layers}, "
+            f"overall KV cache ratio: {_overall_ratio:.4f} ({_overall_ratio*100:.2f}%)"
+        )
+    else:
+        logger.info(
+            f"[KV Cache Info] per-layer selected tokens: {_token_ratio} (absolute), "
+            f"full cache layers: {_num_full}/{_num_layers}, "
+            f"sparse cache layers: {_num_sparse}/{_num_layers}"
+        )
 
     tkn = AutoTokenizer.from_pretrained(model_name)
     if tkn.pad_token is None:
@@ -258,11 +303,11 @@ def get_token_select_llama_chat_api_with_tokenizer_bs1(config_path):
     if use_cot:
         assert use_chat_template
 
+    enable_thinking = config.get("enable_thinking", False)
+    strip_thinking = config.get("strip_thinking", True)
+
     def chat(prompt, generation_config=None, skip_special_tokens=False, **kwargs):
         st = time.time()
-        # if use_sink_cache:
-        #     kwargs['cache_implementation'] = 'sink'
-        #     kwargs['cache_config'] = {'window_length': sink_window_length, 'num_sink_tokens': num_sink_tokens}
         tkn_ids = inference_bs1(
             prompt,
             tkn,
@@ -272,6 +317,7 @@ def get_token_select_llama_chat_api_with_tokenizer_bs1(config_path):
             model_name=model_name,
             use_chat_template=use_chat_template,
             use_fixed_prompt=use_fixed_prompt,
+            enable_thinking=enable_thinking if is_qwen3 else None,
             **kwargs,
         )
         res = tkn.batch_decode(
@@ -279,6 +325,11 @@ def get_token_select_llama_chat_api_with_tokenizer_bs1(config_path):
             skip_special_tokens=skip_special_tokens,
             clean_up_tokenization_spaces=False,
         )[0]
+        # Strip thinking tags from Qwen3 output
+        if "</think>" in res:
+            think_end = res.find("</think>")
+            if think_end != -1:
+                res = res[think_end + len("</think>"):].strip()
         logger.info(f"--- chat time: {round(time.time() - st, 3)}s")
         return res
 

@@ -49,15 +49,47 @@ You are a helpful assistant.<|eot_id|>
 
 {user_message}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 """,
+
+    'qwen3': """<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+{user_message}<|im_end|>
+<|im_start|>assistant
+""",
+
+    'qwen3_thinking': """<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+{user_message}<|im_end|>
+<|im_start|>assistant
+<think>
+""",
+
+    'qwen3_no_thinking': """<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+/no_think
+{user_message}<|im_end|>
+<|im_start|>assistant
+""",
 }
 
 
-def get_chat_template(model_name, use_cot=False):
+def get_chat_template(model_name, use_cot=False, enable_thinking=None):
     model_name = model_name.lower()
     if use_cot:
         warning_once(logger, "!!!!!!正在使用COT")
 
-    if 'llama' in model_name:
+    if 'qwen3' in model_name or 'qwen-3' in model_name:
+        if enable_thinking is True:
+            warning_once(logger, "Qwen3: thinking mode ENABLED")
+            return prompt_template['qwen3_thinking']
+        elif enable_thinking is False:
+            warning_once(logger, "Qwen3: thinking mode DISABLED")
+            return prompt_template['qwen3_no_thinking']
+        else:
+            return prompt_template['qwen3']
+    elif 'llama' in model_name:
         if use_cot:
             return prompt_template['llama_cot']
         else:

@@ -1,12 +1,69 @@
-import torch
+"""
+OmniKV wrappers for Qwen3 model.
+Mirrors modeling/omnikv.py but uses Qwen3 base classes.
+"""
+import math
+import time
 import infer as _infer_module
 
-from modeling.offload_select_once import *
-from modeling.spec_cache import OmniKVMultiStageCache, WOPackCache
-import logging as lgt
+import torch
+import torch.nn as nn
+from typing import Optional, Tuple, Union, List
+
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from modeling.qwen3_modeling import (
+    Qwen3Config,
+    Qwen3DecoderLayer,
+    Qwen3Model,
+    Qwen3ForCausalLM,
+    Qwen3Attention,
+    Qwen3FlashAttention2,
+    QWEN3_ATTENTION_CLASSES,
+    apply_rotary_pos_emb,
+    repeat_kv,
+)
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm, Qwen2MLP
+from modeling.spec_cache import OmniKVMultiStageCache, WOPackCache, get_cache_cls
+from tiny_tools.log import logger, warning_once
+
+last_call_t = time.time()
 
 
-def select_tokens_by_attn_universal(
+def time_analyze():
+    global last_call_t
+    temp = round(time.time() - last_call_t, 4)
+    last_call_t = time.time()
+    return temp
+
+
+# ===================== Config =====================
+
+class Qwen3CompressorConfig(Qwen3Config):
+    """Qwen3 config with OmniKV compressor settings."""
+
+    def set_config(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def set_config_of_compressor(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def get(self, key, default=None):
+        if not hasattr(self, key):
+            setattr(self, key, default)
+            logger.warning(f"{key}不存在，被设置为{default}")
+        return getattr(self, key, default)
+
+    def _rope_scaling_validation(self):
+        return
+
+
+# ===================== Token Selection (adapted for Qwen3) =====================
+
+def select_tokens_by_attn_universal_qwen3(
     raw_attn,
     hidden_states,
     position_ids,
@@ -16,92 +73,68 @@ def select_tokens_by_attn_universal(
     layer_idx=None,
     selector_cls="last",
 ):
+    """Token selection using attention scores, adapted for Qwen3's rotary_emb interface and Q/K norm."""
     bsz, q_len, _ = hidden_states.size()
     assert past_key_value
 
-    if raw_attn.config.get("pretraining_tp", -1) > 1:
-        raise NotImplementedError
-    else:
-        query_states = raw_attn.q_proj(hidden_states)
-        key_states = raw_attn.k_proj(hidden_states)
+    query_states = raw_attn.q_proj(hidden_states)
+    key_states = raw_attn.k_proj(hidden_states)
 
-    query_states = query_states.view(
-        bsz, q_len, raw_attn.num_heads, raw_attn.head_dim
-    ).transpose(1, 2)
-    key_states = key_states.view(
-        bsz, q_len, raw_attn.num_key_value_heads, raw_attn.head_dim
-    ).transpose(1, 2)
+    query_states = query_states.view(bsz, q_len, raw_attn.num_heads, raw_attn.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, raw_attn.num_key_value_heads, raw_attn.head_dim).transpose(1, 2)
 
-    cos, sin = raw_attn.rotary_emb(key_states, position_ids)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    # Qwen3: apply Q/K normalization
+    query_states = raw_attn.q_norm(query_states)
+    key_states = raw_attn.k_norm(key_states)
 
+    # Qwen3/Qwen2 rotary_emb interface: (x, seq_len=N) instead of Llama's (x, position_ids)
+    kv_seq_len = position_ids.max().item() + 1
+    cos, sin = raw_attn.rotary_emb(key_states, seq_len=kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    # Use cached keys for scoring
     key_states = past_key_value.key_cache[raw_attn.layer_idx][:, :, :consider_len]
     key_states = repeat_kv(key_states, raw_attn.num_key_value_groups)
 
     if selector_cls == "last":
-        attn_score = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-            raw_attn.head_dim
-        )
-        attn_score = torch.max(
-            attn_score[..., -1, :], dim=1
-        ).values  # remove query, then head
+        attn_score = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(raw_attn.head_dim)
+        attn_score = torch.max(attn_score[..., -1, :], dim=1).values
         num_selected_tokens = min(num_selected_tokens, attn_score.shape[-1])
         v, idx = torch.topk(attn_score, k=num_selected_tokens, dim=-1, sorted=True)
     elif selector_cls == "softmax_before_last":
-        attn_score = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-            raw_attn.head_dim
-        )
-        attn_score = torch.nn.functional.softmax(attn_score, dim=-1)  # to attn score
-        attn_score = torch.max(
-            attn_score[..., -1, :], dim=1
-        ).values  # remove query, then head
+        attn_score = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(raw_attn.head_dim)
+        attn_score = torch.nn.functional.softmax(attn_score, dim=-1)
+        attn_score = torch.max(attn_score[..., -1, :], dim=1).values
         num_selected_tokens = min(num_selected_tokens, attn_score.shape[-1])
         v, idx = torch.topk(attn_score, k=num_selected_tokens, dim=-1, sorted=True)
     elif selector_cls == "uniform":
         qs = torch.split(query_states, 1, dim=2)
-        first_flag = True
         attn_sum = None
-        logger.debug(f"before = {torch.cuda.memory_allocated() / 1e9} GB")
         for q in qs:
-            attn_score = torch.matmul(q, key_states.transpose(2, 3)) / math.sqrt(
-                raw_attn.head_dim
-            )
-            attn_score = torch.nn.functional.softmax(
-                attn_score, dim=-1
-            )  # to attn score
-            attn_score = torch.max(attn_score, dim=1).values  # remove head dim
-            attn_score = torch.sum(attn_score, dim=-2)  # remove query dim
-            if first_flag:
-                first_flag = False
+            attn_score = torch.matmul(q, key_states.transpose(2, 3)) / math.sqrt(raw_attn.head_dim)
+            attn_score = torch.nn.functional.softmax(attn_score, dim=-1)
+            attn_score = torch.max(attn_score, dim=1).values
+            attn_score = torch.sum(attn_score, dim=-2)
+            if attn_sum is None:
                 attn_sum = attn_score
             else:
                 attn_sum += attn_score
         num_selected_tokens = min(num_selected_tokens, attn_sum.shape[-1])
         v, idx = torch.topk(attn_sum, k=num_selected_tokens, dim=-1, sorted=True)
-        logger.debug(f"after = {torch.cuda.memory_allocated() / 1e9} GB")
     elif selector_cls == "exp":
         qs = torch.split(query_states, 1, dim=2)
-        first_flag = True
         attn_sum = None
         for q in qs:
-            attn_score = torch.matmul(q, key_states.transpose(2, 3)) / math.sqrt(
-                raw_attn.head_dim
-            )
-            attn_score = torch.nn.functional.softmax(
-                attn_score, dim=-1
-            )  # to attn score
-            attn_score = torch.max(attn_score, dim=1).values  # remove head dim
-            q_len = attn_score.shape[-2]
-            alpha = (
-                2
-                ** torch.arange(-q_len + 1, 1, device=attn_score.device)[None, :, None]
-            )
-            attn_score = torch.sum(attn_score * alpha, dim=-2)  # remove query dim
-            if first_flag:
-                first_flag = False
+            attn_score = torch.matmul(q, key_states.transpose(2, 3)) / math.sqrt(raw_attn.head_dim)
+            attn_score = torch.nn.functional.softmax(attn_score, dim=-1)
+            attn_score = torch.max(attn_score, dim=1).values
+            q_len_local = attn_score.shape[-2]
+            alpha = 2 ** torch.arange(-q_len_local + 1, 1, device=attn_score.device)[None, :, None]
+            attn_score = torch.sum(attn_score * alpha, dim=-2)
+            if attn_sum is None:
                 attn_sum = attn_score
             else:
-                attn_sum = attn_sum * (2**-q_len) + attn_score
+                attn_sum = attn_sum * (2**-q_len_local) + attn_score
         num_selected_tokens = min(num_selected_tokens, attn_sum.shape[-1])
         v, idx = torch.topk(attn_sum, k=num_selected_tokens, dim=-1, sorted=True)
     else:
@@ -111,20 +144,11 @@ def select_tokens_by_attn_universal(
     return idx
 
 
-class OmniKVMulLayer(LlamaDecoderLayer):
+# ===================== OmniKV Layer =====================
+
+class Qwen3OmniKVMulLayer(Qwen3DecoderLayer):
     def __init__(self, config, layer_idx):
-        config.rope_scaling = config.rope_scaling_
-        try:
-            super().__init__(config, layer_idx)
-        except Exception:
-            warning_once(logger, "ENSURE using Llama3.1!")
-            config.rope_scaling = None
-            super().__init__(config, layer_idx)
-            self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
-                config=config, layer_idx=layer_idx
-            )
-            config.rope_scaling = config.rope_scaling_
-            self.self_attn.rotary_emb = PatchLlamaRotaryEmbedding(config=config)
+        super().__init__(config, layer_idx)
 
         self.config = config
         self.layer_idx = layer_idx
@@ -150,19 +174,18 @@ class OmniKVMulLayer(LlamaDecoderLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[
-        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+
         if hidden_states.shape[1] > 1:
             self.prefill_len = hidden_states.shape[1]
             if (
                 "last" not in self.selector_cls
                 and self.layer_idx in self.do_select_layers
             ):
-                self.hidden_state_window = hidden_states[:, -self.window_size :]
-                self.decode_step = 1  # 生成了一个token
+                self.hidden_state_window = hidden_states[:, -self.window_size:]
+                self.decode_step = 1
         if past_key_value:
             assert isinstance(past_key_value, self.cache_cls)
 
@@ -180,14 +203,12 @@ class OmniKVMulLayer(LlamaDecoderLayer):
             if "last" not in self.selector_cls:
                 self.hidden_state_window = torch.cat(
                     [self.hidden_state_window, hidden_states], dim=1
-                )[
-                    :, -self.window_size :
-                ]  # noqa
+                )[:, -self.window_size:]
                 window_hs = self.hidden_state_window
                 consider_len -= num_prefill_token_in_window
                 num_selected_tokens -= num_prefill_token_in_window
                 num_selected_tokens = max(1, num_selected_tokens)
-            idx = select_tokens_by_attn_universal(
+            idx = select_tokens_by_attn_universal_qwen3(
                 self.self_attn,
                 window_hs,
                 position_ids,
@@ -208,7 +229,7 @@ class OmniKVMulLayer(LlamaDecoderLayer):
                         )[None, :].repeat(idx.shape[0], 1),
                     ],
                     dim=1,
-                )  # noqa
+                )
             if self.config.get("dense_more", False):
                 past_key_value.set_idx_on_gpu(idx, self.layer_idx)
             else:
@@ -240,52 +261,40 @@ class OmniKVMulLayer(LlamaDecoderLayer):
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
-
         if output_attentions:
             outputs += (self_attn_weights,)
-
         if use_cache:
             outputs += (present_key_value,)
-
         return outputs
 
 
-class OmniKVMulModel(LlamaModel):
-    def __init__(self, config: LlamaConfig):
+# ===================== OmniKV Model =====================
+
+class Qwen3OmniKVMulModel(Qwen3Model):
+    def __init__(self, config: Qwen3Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [
-                OmniKVMulLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [Qwen3OmniKVMulLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
         self.post_init()
 
 
-class OmniKVMulLM(LlamaForCausalLM):
-    def __init__(self, config: LlamaConfig):
-        if (fac := config.get("rope_factor", -1)) > 0:
-            logger.warning("直接设置了rope_scaling")
-            config.rope_scaling = {"type": "dynamic", "factor": fac}
-        config.rope_scaling_ = config.rope_scaling
-        config.rope_scaling = None
+# ===================== OmniKV LM =====================
+
+class Qwen3OmniKVMulLM(Qwen3ForCausalLM):
+    def __init__(self, config: Qwen3Config):
         super().__init__(config)
-        self.model = OmniKVMulModel(config)
+        self.model = Qwen3OmniKVMulModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.max_context_len = config.get("max_context_len", 50_000)
         self.cache_cls = get_cache_cls(config)
-        # Initialize weights and apply final processing
         self.post_init()
 
     def forward(
@@ -302,47 +311,25 @@ class OmniKVMulLM(LlamaForCausalLM):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         n = input_ids.shape[1]
         if not isinstance(past_key_values, Cache):
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
         if not isinstance(past_key_values, self.cache_cls):
             kwargs = {}
-            if (
-                cache_cls_name := self.config.get("cache_cls", "default")
-            ) == "multi" or cache_cls_name == "without_pack":
-                do_sel_layers = [
-                    int(i) for i in self.config.get("do_select_layers").split(",")
-                ]
-                # TODO 这个地方还可以再考虑下
-                full_attn_layers = (
-                    list(range(0, do_sel_layers[0]))
-                    + do_sel_layers
-                    + [self.config.num_hidden_layers]
-                )
+            if (cache_cls_name := self.config.get("cache_cls", "default")) == "multi" or cache_cls_name == "without_pack":
+                do_sel_layers = [int(i) for i in self.config.get("do_select_layers").split(",")]
+                full_attn_layers = list(range(0, do_sel_layers[0])) + do_sel_layers + [self.config.num_hidden_layers]
                 kwargs["full_attn_layers"] = full_attn_layers
                 kwargs["num_hidden_layers"] = self.config.num_hidden_layers
-                kwargs["num_wait_load_layers"] = self.config.get(
-                    "num_wait_load_layers", 2
-                )
+                kwargs["num_wait_load_layers"] = self.config.get("num_wait_load_layers", 2)
                 kwargs["real_offload"] = self.config.get("real_offload", True)
             else:
                 raise NotImplementedError
-            past_key_values = self.cache_cls.from_dynamic_cache(
-                past_key_values, **kwargs
-            )
+            past_key_values = self.cache_cls.from_dynamic_cache(past_key_values, **kwargs)
 
         if n == 1:
             past_key_values.stage = "decoding"
@@ -363,14 +350,9 @@ class OmniKVMulLM(LlamaForCausalLM):
         )
 
         hidden_states = outputs[0][:, -1:]
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(
-                self.vocab_size // self.config.pretraining_tp, dim=0
-            )
-            logits = [
-                F.linear(hidden_states, lm_head_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
+        if getattr(self.config, "pretraining_tp", 1) > 1:
+            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)
