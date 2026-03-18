@@ -330,7 +330,7 @@ if __name__ == '__main__':
 
     def _make_bar(pct, width=10):
         filled = int(width * pct / 100)
-        return '#' * filled + ' ' * (width - filled)
+        return '█' * filled + ' ' * (width - filled)
 
     def _log_progress(dataset_name, sample_idx, sample_total, elapsed,
                       pred, answers, all_classes):
