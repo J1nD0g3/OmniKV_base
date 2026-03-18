@@ -66,7 +66,7 @@ def post_process(response, model_name):
 
 
 def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path,
-             out_path, args):
+             out_path, args, progress_fn=None):
     seed_everything(42)
     d_cfg = read_config(args.cfg)
     device = 0
@@ -83,7 +83,8 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
         max_length = model_max_length
         print(f"max_length is set to {max_length}")
 
-    for json_obj in tqdm(data, desc=f'{dataset}'):
+    _sample_start = time.time()
+    for _sample_i, json_obj in enumerate(tqdm(data, desc=f'{dataset}')):
         prompt = prompt_format.format(**json_obj)
         # truncate to fit max_length (we suggest truncate in the middle,
         # since the left and right side may contain crucial instructions)
@@ -162,6 +163,11 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                        "output_len": meta.get("output_len"),
                        "num_selected_kv": meta.get("num_selected_kv")}, f, ensure_ascii=False)
             f.write('\n')
+
+        if progress_fn:
+            progress_fn(dataset, _sample_i, len(data), time.time() - _sample_start,
+                        pred, json_obj["answers"], json_obj.get("all_classes", None))
+            _sample_start = time.time()
 
         # 用来分析模型性质的code:::
         if os.environ.get('SAVE_SELECTED_IDX', False):
@@ -277,9 +283,96 @@ if __name__ == '__main__':
     torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
     per_dataset_stats = {}
 
+    # Pre-compute total samples and create progress log
     base_path = ''
     if os.environ.get("NO_NAS", False):
         base_path = '/jitai/'
+
+    _all_data_counts = {}
+    for _ds in datasets:
+        _ds_file = f'benchmark/long_bench/data/{_ds}{"_e" if args.e else ""}.jsonl'
+        if os.path.exists(_ds_file):
+            _cnt = sum(1 for _ in open(_ds_file))
+            _all_data_counts[_ds] = min(_cnt, args.n) if args.n > 0 else _cnt
+    total_samples = sum(_all_data_counts.values())
+
+    model_short_name = os.path.basename(d_cfg.get("model_name", "unknown"))
+    _think_str = "think-on" if enable_thinking else "think-off"
+    _run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    _run_name = f"{model_short_name}_longbench_{_think_str}_{_run_timestamp}"
+    _run_dir = os.path.join("logs", _run_name)
+    os.makedirs(os.path.join(_run_dir, "samples"), exist_ok=True)
+    progress_log_path = os.path.join(_run_dir, "progress.log")
+
+    # Import metrics for real-time score tracking in progress log
+    from metrics import (
+        qa_f1_score, rouge_zh_score, qa_f1_zh_score, rouge_score,
+        classification_score, retrieval_score, retrieval_zh_score,
+        count_score, code_sim_score,
+    )
+    _progress_metric_fn = {
+        "narrativeqa": qa_f1_score, "qasper": qa_f1_score,
+        "multifieldqa_en": qa_f1_score, "multifieldqa_zh": qa_f1_zh_score,
+        "hotpotqa": qa_f1_score, "2wikimqa": qa_f1_score, "musique": qa_f1_score,
+        "dureader": rouge_zh_score, "gov_report": rouge_score, "qmsum": rouge_score,
+        "multi_news": rouge_score, "vcsum": rouge_zh_score,
+        "trec": classification_score, "triviaqa": qa_f1_score, "samsum": rouge_score,
+        "lsht": classification_score, "passage_retrieval_en": retrieval_score,
+        "passage_count": count_score, "passage_retrieval_zh": retrieval_zh_score,
+        "lcc": code_sim_score, "repobench-p": code_sim_score,
+    }
+    _progress_state = {
+        "ds_scores": [],       # scores for current dataset
+        "ds_start_time": 0.0,  # start time of current dataset
+        "ds_elapsed": [],      # per-sample elapsed times for rate calc
+        "current_ds": None,
+    }
+
+    def _make_bar(pct, width=10):
+        filled = int(width * pct / 100)
+        return '#' * filled + ' ' * (width - filled)
+
+    def _log_progress(dataset_name, sample_idx, sample_total, elapsed,
+                      pred, answers, all_classes):
+        # Reset state on new dataset
+        if _progress_state["current_ds"] != dataset_name:
+            _progress_state["current_ds"] = dataset_name
+            _progress_state["ds_scores"] = []
+            _progress_state["ds_start_time"] = time.time() - elapsed
+            _progress_state["ds_elapsed"] = []
+
+        _progress_state["ds_elapsed"].append(elapsed)
+
+        # Compute score for this sample (max over ground truths, same as eval)
+        metric_fn = _progress_metric_fn.get(dataset_name)
+        score = 0.
+        if metric_fn and isinstance(answers, list):
+            pred_text = pred
+            if dataset_name in ["trec", "triviaqa", "samsum", "lsht"]:
+                pred_text = pred_text.lstrip('\n').split('\n')[0]
+            for gt in answers:
+                try:
+                    score = max(score, metric_fn(pred_text, gt, all_classes=all_classes))
+                except Exception:
+                    pass
+        _progress_state["ds_scores"].append(score)
+        avg_score = sum(_progress_state["ds_scores"]) / len(_progress_state["ds_scores"])
+
+        # tqdm-style formatting
+        done = sample_idx + 1
+        pct = done / sample_total * 100
+        bar = _make_bar(pct)
+        total_elapsed = sum(_progress_state["ds_elapsed"])
+        rate = total_elapsed / done
+        remaining = rate * (sample_total - done)
+
+        line = (f"Running longbench/{dataset_name}: "
+                f"{pct:3.0f}%|{bar}| {done}/{sample_total} "
+                f"[{total_elapsed:05.1f}<{remaining:05.1f}, {rate:.2f}s/it, "
+                f"avg_score={round(avg_score, 3)}]\n")
+        with open(progress_log_path, "a") as pf:
+            pf.write(line)
+
     for dataset in datasets:
         if args.e:
             data = load_dataset(f'benchmark/long_bench/data/{dataset}_e.jsonl', 'r')
@@ -304,7 +397,7 @@ if __name__ == '__main__':
         ds_start = time.time()
         get_pred(0, world_size, data_all, max_length,
                  max_gen, prompt_format, dataset, None, model_name, model2path,
-                 out_path, args)
+                 out_path, args, progress_fn=_log_progress)
         ds_elapsed = time.time() - ds_start
         ds_peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0
         per_dataset_stats[dataset] = {
@@ -439,14 +532,9 @@ if __name__ == '__main__':
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
 
     # ===== Create log directory structure =====
-    model_short = os.path.basename(d_cfg.get("model_name", "unknown"))
-    think_str = "think-on" if enable_thinking else "think-off"
-    run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_name = f"{model_short}_longbench_{think_str}_{run_timestamp}"
-    log_base = "logs"
-    run_dir = os.path.join(log_base, run_name)
+    run_dir = _run_dir
+    run_name = _run_name
     samples_dir = os.path.join(run_dir, "samples")
-    os.makedirs(samples_dir, exist_ok=True)
 
     # ===== Save per-sample details per dataset =====
     for ds_name, details in sample_details.items():
