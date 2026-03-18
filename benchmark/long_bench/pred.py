@@ -102,6 +102,10 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
 
         input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
         context_length = input.input_ids.shape[-1]
+        # Dynamically set max_gen for thinking mode: max_context_len - input_len
+        _max_gen = max_gen
+        if d_cfg.get("enable_thinking", False):
+            _max_gen = max(max_gen, d_cfg.get("max_context_len", 32000) - context_length)
         if dataset == "samsum":
             # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
             if "my_model" not in model_name:
@@ -117,7 +121,7 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
             else:
                 output = model(
                     prompt, generation_config=None,
-                    max_new_tokens=max_gen,
+                    max_new_tokens=_max_gen,
                     num_beams=1,
                     do_sample=False,
                     temperature=1.0,
@@ -137,7 +141,7 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
             else:
                 output = model(
                     prompt, generation_config=None,
-                    max_new_tokens=max_gen,
+                    max_new_tokens=_max_gen,
                     num_beams=1,
                     do_sample=False,
                     temperature=1.0,
@@ -262,12 +266,10 @@ if __name__ == '__main__':
     dataset2prompt = json.load(open("benchmark/long_bench/config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("benchmark/long_bench/config/dataset2maxlen.json", "r"))
 
-    # Increase max_gen when thinking mode is enabled
     enable_thinking = d_cfg.get("enable_thinking", False)
-    thinking_extra_tokens = d_cfg.get("thinking_extra_tokens", 4096)
+    thinking_max_context = d_cfg.get("max_context_len", 32000)
     if enable_thinking:
-        print(f"[Thinking ON] Adding {thinking_extra_tokens} extra tokens to max_gen for each dataset")
-        dataset2maxlen = {k: v + thinking_extra_tokens for k, v in dataset2maxlen.items()}
+        print(f"[Thinking ON] max_gen will be dynamically set to max_context_len({thinking_max_context}) - input_len per sample")
 
     # Track experiment timing and memory
     exp_start_time = time.time()
@@ -331,6 +333,30 @@ if __name__ == '__main__':
         "passage_count": count_score, "passage_retrieval_zh": retrieval_zh_score,
         "lcc": code_sim_score, "repobench-p": code_sim_score,
     }
+    _dataset2metric_name = {
+        "narrativeqa": "qa_f1_score", "qasper": "qa_f1_score",
+        "multifieldqa_en": "qa_f1_score", "multifieldqa_zh": "qa_f1_zh_score",
+        "hotpotqa": "qa_f1_score", "2wikimqa": "qa_f1_score", "musique": "qa_f1_score",
+        "dureader": "rouge_zh_score", "gov_report": "rouge_score", "qmsum": "rouge_score",
+        "multi_news": "rouge_score", "vcsum": "rouge_zh_score",
+        "trec": "classification_score", "triviaqa": "qa_f1_score", "samsum": "rouge_score",
+        "lsht": "classification_score", "passage_retrieval_en": "retrieval_score",
+        "passage_count": "count_score", "passage_retrieval_zh": "retrieval_zh_score",
+        "lcc": "code_sim_score", "repobench-p": "code_sim_score",
+    }
+    _dataset2group = {
+        "narrativeqa": "Single-Document QA", "qasper": "Single-Document QA",
+        "multifieldqa_en": "Single-Document QA", "multifieldqa_zh": "Single-Document QA",
+        "hotpotqa": "Multi-Document QA", "2wikimqa": "Multi-Document QA",
+        "musique": "Multi-Document QA", "dureader": "Multi-Document QA",
+        "gov_report": "Summarization", "qmsum": "Summarization",
+        "multi_news": "Summarization", "vcsum": "Summarization",
+        "trec": "Few-shot Learning", "triviaqa": "Few-shot Learning",
+        "samsum": "Few-shot Learning", "lsht": "Few-shot Learning",
+        "passage_count": "Synthetic Tasks", "passage_retrieval_en": "Synthetic Tasks",
+        "passage_retrieval_zh": "Synthetic Tasks",
+        "lcc": "Code Completion", "repobench-p": "Code Completion",
+    }
 
     if args.e:
         pred_dir = f"{base_path}benchmark/long_bench/pred_e/{model_name}/{args.cfg}"
@@ -338,7 +364,8 @@ if __name__ == '__main__':
         pred_dir = f"{base_path}benchmark/long_bench/pred/{model_name}/{args.cfg}"
 
     scores = {}
-    sample_details = {}  # per-dataset list of {input_len, output_len, num_selected_kv}
+    sample_details = {}
+    per_sample_scores = {}
     for filename in os.listdir(pred_dir):
         if not filename.endswith("jsonl"):
             continue
@@ -360,15 +387,17 @@ if __name__ == '__main__':
         if not predictions:
             continue
         try:
-            total_score = 0.
+            sample_scores = []
             for pred_text, ground_truths in zip(predictions, answers):
                 s = 0.
                 if ds_name in ["trec", "triviaqa", "samsum", "lsht"]:
                     pred_text = pred_text.lstrip('\n').split('\n')[0]
                 for gt in ground_truths:
                     s = max(s, _dataset2metric[ds_name](pred_text, gt, all_classes=all_classes))
-                total_score += s
-            scores[ds_name] = round(100 * total_score / len(predictions), 2)
+                sample_scores.append(s)
+            scores[ds_name] = round(100 * np.mean(sample_scores), 2)
+            stderr = round(100 * np.std(sample_scores) / np.sqrt(len(sample_scores)), 4) if len(sample_scores) > 1 else 0
+            per_sample_scores[ds_name] = {"scores": sample_scores, "stderr": stderr}
         except Exception as e:
             print(f"eval error in {ds_name}: {e}")
 
@@ -376,14 +405,12 @@ if __name__ == '__main__':
     result_path = f"{pred_dir}/result.json"
     with open(result_path, "w") as f:
         json.dump(scores, f, ensure_ascii=False, indent=4)
-    print(f"Scores: {scores}")
 
     # Compute KV cache ratio
     _do_sel = [int(i) for i in d_cfg.get("do_select_layers", "0").split(",")]
     _nwait = d_cfg.get("num_wait_load_layers", 2)
     _token_ratio = d_cfg.get("num_of_selected_tokens", 4096)
     _num_layers = None
-    # Try to get num_hidden_layers from model config
     model_cfg_path = os.path.join(d_cfg["model_name"], "config.json")
     if os.path.exists(model_cfg_path):
         with open(model_cfg_path) as f:
@@ -409,76 +436,209 @@ if __name__ == '__main__':
             "overall_kv_cache_ratio": round(overall_ratio, 4),
         }
 
-    # GPU info
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
 
-    # Summarize per-dataset sample details (input_len, output_len, num_selected_kv)
-    inference_stats = {}
+    # ===== Create log directory structure =====
+    model_short = os.path.basename(d_cfg.get("model_name", "unknown"))
+    think_str = "think-on" if enable_thinking else "think-off"
+    run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f"{model_short}_longbench_{think_str}_{run_timestamp}"
+    log_base = "logs"
+    run_dir = os.path.join(log_base, run_name)
+    samples_dir = os.path.join(run_dir, "samples")
+    os.makedirs(samples_dir, exist_ok=True)
+
+    # ===== Save per-sample details per dataset =====
+    for ds_name, details in sample_details.items():
+        sample_file = os.path.join(samples_dir, f"{ds_name}.json")
+        ds_sample_data = []
+        ds_scores_list = per_sample_scores.get(ds_name, {}).get("scores", [])
+        for i, d in enumerate(details):
+            entry = {
+                "sample_idx": i,
+                "input_len": d.get("input_len"),
+                "output_len": d.get("output_len"),
+                "num_selected_kv": d.get("num_selected_kv"),
+            }
+            if d.get("input_len") and d.get("num_selected_kv"):
+                entry["kv_select_ratio"] = round(d["num_selected_kv"] / d["input_len"], 4)
+            if i < len(ds_scores_list):
+                entry["score"] = round(ds_scores_list[i], 4)
+            ds_sample_data.append(entry)
+        with open(sample_file, "w") as f:
+            json.dump(ds_sample_data, f, indent=2)
+
+    # ===== Build lm_eval-style results table =====
+    # Compute group scores
+    group_scores = {}
+    group_stderrs = {}
+    for ds_name, score in scores.items():
+        grp = _dataset2group.get(ds_name, "Other")
+        if grp not in group_scores:
+            group_scores[grp] = []
+            group_stderrs[grp] = []
+        group_scores[grp].append(score / 100.0)
+        group_stderrs[grp].append(per_sample_scores.get(ds_name, {}).get("stderr", 0) / 100.0)
+    for grp in group_scores:
+        vals = group_scores[grp]
+        group_scores[grp] = round(np.mean(vals), 4)
+        group_stderrs[grp] = round(np.mean(group_stderrs[grp]), 4)
+
+    n_samples = args.n if args.n > 0 else "all"
+
+    # Build table lines
+    task_lines = []
+    group_lines = []
+    # Sort groups
+    group_order = ["Single-Document QA", "Multi-Document QA", "Summarization",
+                   "Few-shot Learning", "Synthetic Tasks", "Code Completion"]
+    for grp in group_order:
+        if grp not in group_scores:
+            continue
+        task_lines.append({
+            "task": f"- {grp}", "n_shot": "", "metric": "score",
+            "value": group_scores[grp], "stderr": group_stderrs[grp], "is_group": True,
+        })
+        group_lines.append({
+            "group": f"- {grp}", "value": group_scores[grp], "stderr": group_stderrs[grp],
+        })
+        # Add individual datasets under this group
+        for ds_name in sorted(scores.keys()):
+            if _dataset2group.get(ds_name) != grp:
+                continue
+            stderr_val = per_sample_scores.get(ds_name, {}).get("stderr", 0) / 100.0
+            task_lines.append({
+                "task": f" - longbench_{ds_name}", "n_shot": 0,
+                "metric": _dataset2metric_name.get(ds_name, "score"),
+                "value": scores[ds_name] / 100.0, "stderr": stderr_val, "is_group": False,
+            })
+
+    def _fmt_table(task_lines):
+        lines = []
+        hdr = f"|{'Tasks':^35}|{'n-shot':>6}|{'Metric':^20}|   |{'Value':>6} |   |{'Stderr':>6}|"
+        sep = f"|{'-'*35}|{'-'*6}:|{'-'*20}|---|{'-'*6}:|---|{'-'*6}:|"
+        lines.append(hdr)
+        lines.append(sep)
+        for t in task_lines:
+            ns = str(t["n_shot"]) if t["n_shot"] != "" else ""
+            lines.append(
+                f"|{t['task']:<35}|{ns:>6}|{t['metric']:<20}|{'↑':^3}|{t['value']:>6.4f}|{'±':^3}|{t['stderr']:>6.4f}|"
+            )
+        return "\n".join(lines)
+
+    def _fmt_group_table(group_lines):
+        lines = []
+        hdr = f"|{'Groups':^25}|{'Metric':^8}|   |{'Value':>6} |   |{'Stderr':>6}|"
+        sep = f"|{'-'*25}|{'-'*8}|---|{'-'*6}:|---|{'-'*6}:|"
+        lines.append(hdr)
+        lines.append(sep)
+        for g in group_lines:
+            lines.append(
+                f"|{g['group']:<25}|{'score':<8}|{'↑':^3}|{g['value']:>6.4f}|{'±':^3}|{g['stderr']:>6.4f}|"
+            )
+        return "\n".join(lines)
+
+    # ===== Build summary text =====
+    summary_parts = []
+    summary_parts.append(f"{'='*70}")
+    summary_parts.append(f"OmniKV LongBench Experiment Log")
+    summary_parts.append(f"{'='*70}")
+    summary_parts.append(f"")
+    summary_parts.append(f"Timestamp:          {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    summary_parts.append(f"Config:             {args.cfg}")
+    summary_parts.append(f"Model:              {d_cfg.get('model_name', 'unknown')}")
+    summary_parts.append(f"Model class:        {d_cfg.get('model_cls', 'unknown')}")
+    summary_parts.append(f"Thinking mode:      {'ON' if enable_thinking else 'OFF'}")
+    summary_parts.append(f"Max context len:    {d_cfg.get('max_context_len', -1)}")
+    summary_parts.append(f"Samples/dataset:    {n_samples}")
+    summary_parts.append(f"")
+    summary_parts.append(f"--- Hardware ---")
+    summary_parts.append(f"GPU:                {gpu_name}")
+    summary_parts.append(f"Peak GPU memory:    {peak_gpu_mem:.2f} GB")
+    summary_parts.append(f"Total elapsed time: {exp_total_time:.1f}s ({exp_total_time/60:.1f}min)")
+    summary_parts.append(f"")
+    summary_parts.append(f"--- KV Cache ---")
+    if kv_cache_info:
+        summary_parts.append(f"Per-layer ratio:    {kv_cache_info['per_layer_token_ratio']*100:.2f}%")
+        summary_parts.append(f"Full cache layers:  {kv_cache_info['full_cache_layers']}/{kv_cache_info['total_layers']}")
+        summary_parts.append(f"Sparse layers:      {kv_cache_info['sparse_cache_layers']}/{kv_cache_info['total_layers']}")
+        summary_parts.append(f"Overall KV ratio:   {kv_cache_info['overall_kv_cache_ratio']*100:.2f}%")
+        summary_parts.append(f"Select layers:      {d_cfg.get('do_select_layers', 'N/A')}")
+        summary_parts.append(f"Selector:           {d_cfg.get('selector_cls', 'N/A')}")
+    else:
+        summary_parts.append(f"(not available)")
+    summary_parts.append(f"")
+    summary_parts.append(f"--- Per-Dataset Timing ---")
+    for ds_name, stat in per_dataset_stats.items():
+        summary_parts.append(f"  {ds_name:30s}  {stat['num_samples']:>4} samples  {stat['elapsed_time_s']:>8.1f}s  peak {stat['peak_gpu_memory_gb']:.2f}GB")
+    summary_parts.append(f"")
+    summary_parts.append(f"--- Results ---")
+    summary_parts.append(f"")
+    if task_lines:
+        summary_parts.append(_fmt_table(task_lines))
+        summary_parts.append(f"")
+        summary_parts.append(_fmt_group_table(group_lines))
+    else:
+        summary_parts.append(f"  (no scores available)")
+    summary_parts.append(f"")
+    avg_score = round(np.mean(list(scores.values())), 2) if scores else 0
+    summary_parts.append(f"Average score (all datasets): {avg_score}")
+    summary_parts.append(f"")
+
+    # Inference stats summary
+    summary_parts.append(f"--- Inference Stats ---")
     for ds_name, details in sample_details.items():
         input_lens = [d["input_len"] for d in details if d.get("input_len") is not None]
         output_lens = [d["output_len"] for d in details if d.get("output_len") is not None]
         selected_kvs = [d["num_selected_kv"] for d in details if d.get("num_selected_kv") is not None]
-        stat = {}
+        parts = [f"  {ds_name}:"]
         if input_lens:
-            stat["input_len"] = {"mean": round(np.mean(input_lens), 1), "min": min(input_lens), "max": max(input_lens)}
+            parts.append(f"input_len={np.mean(input_lens):.0f} [{min(input_lens)}-{max(input_lens)}]")
         if output_lens:
-            stat["output_len"] = {"mean": round(np.mean(output_lens), 1), "min": min(output_lens), "max": max(output_lens)}
+            parts.append(f"output_len={np.mean(output_lens):.0f} [{min(output_lens)}-{max(output_lens)}]")
         if selected_kvs:
-            stat["num_selected_kv"] = {"mean": round(np.mean(selected_kvs), 1), "min": min(selected_kvs), "max": max(selected_kvs)}
+            parts.append(f"selected_kv={np.mean(selected_kvs):.0f} [{min(selected_kvs)}-{max(selected_kvs)}]")
         if input_lens and selected_kvs:
             ratios = [s / i for s, i in zip(selected_kvs, input_lens) if i > 0]
-            stat["actual_kv_select_ratio"] = {"mean": round(np.mean(ratios), 4), "min": round(min(ratios), 4), "max": round(max(ratios), 4)}
-        stat["samples"] = details
-        inference_stats[ds_name] = stat
+            parts.append(f"ratio={np.mean(ratios):.4f}")
+        summary_parts.append("  ".join(parts))
+    summary_parts.append(f"")
+    summary_parts.append(f"{'='*70}")
 
-    # Build experiment log
+    summary_text = "\n".join(summary_parts)
+
+    # Save summary.txt
+    summary_txt_path = os.path.join(run_dir, "summary.txt")
+    with open(summary_txt_path, "w") as f:
+        f.write(summary_text)
+
+    # Save summary.json
     exp_log = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "config_path": args.cfg,
         "model_name": d_cfg.get("model_name", "unknown"),
         "model_cls": d_cfg.get("model_cls", "unknown"),
         "enable_thinking": enable_thinking,
-        "num_samples_per_dataset": args.n if args.n > 0 else "all",
+        "num_samples_per_dataset": n_samples,
         "max_context_len": d_cfg.get("max_context_len", -1),
         "kv_cache": kv_cache_info,
         "scores": scores,
-        "avg_score": round(np.mean(list(scores.values())), 2) if scores else 0,
+        "avg_score": avg_score,
+        "per_sample_stderr": {k: v["stderr"] for k, v in per_sample_scores.items()},
+        "group_scores": {k: round(v * 100, 2) for k, v in group_scores.items()},
         "per_dataset_stats": per_dataset_stats,
-        "inference_stats": inference_stats,
         "total_elapsed_time_s": round(exp_total_time, 2),
         "peak_gpu_memory_gb": round(peak_gpu_mem, 2),
         "gpu": gpu_name,
         "datasets_evaluated": list(scores.keys()),
     }
-
-    # Save log file
-    log_dir = f"{pred_dir}"
-    log_filename = f"experiment_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    log_path = os.path.join(log_dir, log_filename)
-    with open(log_path, "w") as f:
+    summary_json_path = os.path.join(run_dir, "summary.json")
+    with open(summary_json_path, "w") as f:
         json.dump(exp_log, f, ensure_ascii=False, indent=4)
 
-    # Print summary
-    print(f"\n{'='*60}")
-    print(f"Experiment Summary")
-    print(f"{'='*60}")
-    print(f"  Model:            {d_cfg.get('model_name', 'unknown')}")
-    print(f"  Thinking:         {'ON' if enable_thinking else 'OFF'}")
-    print(f"  Datasets:         {list(scores.keys())}")
-    print(f"  Avg Score:        {exp_log['avg_score']}")
-    print(f"  Total Time:       {exp_total_time:.1f}s")
-    print(f"  Peak GPU Memory:  {peak_gpu_mem:.2f} GB")
-    print(f"  GPU:              {gpu_name}")
-    if kv_cache_info:
-        print(f"  KV Cache Ratio:   {kv_cache_info['overall_kv_cache_ratio']*100:.2f}% "
-              f"(per-layer: {kv_cache_info['per_layer_token_ratio']*100:.2f}%, "
-              f"full: {kv_cache_info['full_cache_layers']}, sparse: {kv_cache_info['sparse_cache_layers']})")
-    print(f"  Scores:           {scores}")
-    for ds_name, stat in inference_stats.items():
-        if "input_len" in stat and "num_selected_kv" in stat:
-            print(f"  [{ds_name}] input_len: {stat['input_len']}, "
-                  f"output_len: {stat.get('output_len', 'N/A')}, "
-                  f"selected_kv: {stat['num_selected_kv']}, "
-                  f"actual_ratio: {stat.get('actual_kv_select_ratio', 'N/A')}")
-    print(f"  Log saved to:     {log_path}")
-    print(f"{'='*60}")
+    # Print summary to stdout
+    print(f"\n{summary_text}")
+    print(f"\nLogs saved to: {run_dir}/")
+    print(f"  summary.txt   - formatted results")
+    print(f"  summary.json  - machine-readable results")
+    print(f"  samples/      - per-sample details")
