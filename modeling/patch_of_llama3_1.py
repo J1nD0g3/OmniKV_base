@@ -7,6 +7,7 @@ logger = logging.get_logger(__name__)
 
 if is_torch_available():
     import torch
+    import torch.nn as nn
 
 
 def _compute_default_rope_parameters(

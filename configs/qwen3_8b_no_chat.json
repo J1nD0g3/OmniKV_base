@@ -1,6 +1,6 @@
 {
     "cpu_num_threads": 8,
-    "use_chat_template": true,
+    "use_chat_template": false,
     "cot": false,
     "max_context_len": 32000,
     "model_name": "/home/jheo/models/Qwen3-8B",

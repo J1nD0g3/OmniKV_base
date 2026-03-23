@@ -83,8 +83,8 @@ def inference_bs1(
             for eos_token in ["<|eot_id|>", "<|endoftext|>", "<|im_end|>"]:
                 if eos_token in tkn.vocab:
                     terminators += [tkn.convert_tokens_to_ids(eos_token)]
+            enable_thinking = kwargs.pop("enable_thinking", None)
             if use_chat_template:
-                enable_thinking = kwargs.pop("enable_thinking", None)
                 template = get_chat_template(model_name, use_cot, enable_thinking=enable_thinking)
                 prompt = template.format(
                     user_message=prompt, system_prompt="You are a helpful assistant."
