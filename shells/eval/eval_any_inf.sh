@@ -32,7 +32,7 @@ for task in "${tasks[@]}"; do
     if [ "$NO_INFER" != "1" ]; then
       python benchmark/infinite_bench/src/eval_any_my_model.py \
         --task "$task" \
-        --data_dir "/input/fangshuai.fs/huggingface/repo/InfiniteBench" \
+        --data_dir "/home/jheo/data/InfiniteBench" \
         --output_dir "benchmark/infinite_bench/results/token_select/$1" \
         --config_path "$1"
     fi
@@ -40,7 +40,7 @@ done
 
 python benchmark/infinite_bench/src/compute_scores.py \
   --task "all" \
-  --data_dir "/input/fangshuai.fs/huggingface/repo/InfiniteBench" \
+  --data_dir "/home/jheo/data/InfiniteBench" \
   --output_dir "benchmark/infinite_bench/results/token_select/$1" \
   --config_path "$1"
 

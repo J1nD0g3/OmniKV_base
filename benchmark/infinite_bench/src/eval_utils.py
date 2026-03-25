@@ -35,18 +35,18 @@ DATA_NAME_TO_PATH = {
 }
 
 DATA_NAME_TO_MAX_NEW_TOKENS = {
-    "passkey": 6,
-    "number_string": 12,
+    "passkey": 30,
+    "number_string": 50,
     "kv_retrieval": 50,
     "longbook_sum_eng": 1200,
     "longbook_choice_eng": 40,
     "longbook_qa_eng": 40,
     "longbook_qa_chn": 40,
     "longdialogue_qa_eng": 40,
-    "math_find": 3,
+    "math_find": 30,
     "math_calc": 30000,
     "code_run": 5,
-    "code_debug": 5,
+    "code_debug": 30,
 }
 
 MODEL_TO_PROMPT_TEMPLATE = {

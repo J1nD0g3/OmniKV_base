@@ -179,7 +179,11 @@ class Qwen3OmniKVMulLayer(Qwen3DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         if hidden_states.shape[1] > 1:
-            self.prefill_len = hidden_states.shape[1]
+            # Accumulate prefill_len for chunked prefill support
+            if self.prefill_len is None:
+                self.prefill_len = hidden_states.shape[1]
+            else:
+                self.prefill_len += hidden_states.shape[1]
             if (
                 "last" not in self.selector_cls
                 and self.layer_idx in self.do_select_layers
@@ -336,18 +340,49 @@ class Qwen3OmniKVMulLM(Qwen3ForCausalLM):
         else:
             past_key_values.stage = "prefill"
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
+        # Chunked prefill to avoid OOM on long sequences
+        prefill_chunk_size = self.config.get("prefill_chunk_size", 8192)
+        if n > 1 and n > prefill_chunk_size:
+            # Process input in chunks, each chunk attends to all previous via KV cache
+            for chunk_start in range(0, n, prefill_chunk_size):
+                chunk_end = min(chunk_start + prefill_chunk_size, n)
+                chunk_input_ids = input_ids[:, chunk_start:chunk_end]
+                chunk_position_ids = position_ids[:, chunk_start:chunk_end] if position_ids is not None else None
+                chunk_cache_position = cache_position[chunk_start:chunk_end] if cache_position is not None else None
+
+                # For chunked prefill, attention_mask covers all tokens seen so far
+                chunk_attention_mask = attention_mask[:, :chunk_end] if attention_mask is not None else None
+
+                outputs = self.model(
+                    input_ids=chunk_input_ids,
+                    attention_mask=chunk_attention_mask,
+                    position_ids=chunk_position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=None,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    cache_position=chunk_cache_position,
+                )
+                # Update past_key_values from outputs for next chunk
+                if hasattr(outputs, 'past_key_values'):
+                    past_key_values = outputs.past_key_values
+                elif isinstance(outputs, tuple) and len(outputs) > 1:
+                    past_key_values = outputs[1]
+        else:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
 
         hidden_states = outputs[0][:, -1:]
         if getattr(self.config, "pretraining_tp", 1) > 1:
