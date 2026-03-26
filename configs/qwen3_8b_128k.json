@@ -3,7 +3,7 @@
     "use_chat_template": true,
     "cot": false,
     "max_context_len": 128000,
-    "model_name": "/home/jheo/models/Qwen3-8B-128k",
+    "model_name": "/workspace/models/Qwen3-8B-128k",
     "model_arch": "qwen3",
     "load_in_8bit": false,
     "load_in_4bit": false,

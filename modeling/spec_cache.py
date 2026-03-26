@@ -175,8 +175,16 @@ class DynamicSubOffloadTrueCache(transformers.cache_utils.DynamicCache):
                         non_blocking=(layer_idx != self.num_total_layers - 1),
                     )
                 )
-                self.key_cache.append(_key)
-                self.value_cache.append(_value)
+                if len(self.key_cache) <= layer_idx:
+                    self.key_cache.append(_key)
+                    self.value_cache.append(_value)
+                else:
+                    self.key_cache[layer_idx] = torch.cat(
+                        [self.key_cache[layer_idx], _key], dim=-2
+                    )
+                    self.value_cache[layer_idx] = torch.cat(
+                        [self.value_cache[layer_idx], _value], dim=-2
+                    )
                 logger.info(f"L{layer_idx} offload to cpu {time.time() - st}")
                 if layer_idx == self.num_total_layers - 1:
                     self.mamba_k = torch.cat(
@@ -328,12 +336,25 @@ class OmniKVMultiStageCache(transformers.cache_utils.DynamicCache):
                     non_blocking=not is_last_layer,
                 )
 
-                self.key_cache.append(_key)
-                self.value_cache.append(_value)
+                if len(self.key_cache) <= layer_idx:
+                    self.key_cache.append(_key)
+                    self.value_cache.append(_value)
+                else:
+                    self.key_cache[layer_idx] = torch.cat(
+                        [self.key_cache[layer_idx], _key], dim=-2
+                    )
+                    self.value_cache[layer_idx] = torch.cat(
+                        [self.value_cache[layer_idx], _value], dim=-2
+                    )
                 logger.info(
                     f"Layer={layer_idx} offload to cpu {round(time.time() - st, 3)}s"
                 )
-                return key_states, value_states
+                # Return accumulated cache for chunked prefill cross-chunk attention.
+                # For real_offload (CPU cache), fall back to current chunk only.
+                if self.device is None:
+                    return self.key_cache[layer_idx], self.value_cache[layer_idx]
+                else:
+                    return key_states, value_states
             else:
                 if layer_idx not in self.tail_k:
                     self.tail_k[layer_idx] = key_states
@@ -457,12 +478,25 @@ class WOPackCache(transformers.cache_utils.DynamicCache):
                     non_blocking=not is_last_layer,
                 )
 
-                self.key_cache.append(_key)
-                self.value_cache.append(_value)
+                if len(self.key_cache) <= layer_idx:
+                    self.key_cache.append(_key)
+                    self.value_cache.append(_value)
+                else:
+                    self.key_cache[layer_idx] = torch.cat(
+                        [self.key_cache[layer_idx], _key], dim=-2
+                    )
+                    self.value_cache[layer_idx] = torch.cat(
+                        [self.value_cache[layer_idx], _value], dim=-2
+                    )
                 logger.info(
                     f"Layer={layer_idx} offload to cpu {round(time.time() - st, 3)}s"
                 )
-                return key_states, value_states
+                # Return accumulated cache for chunked prefill cross-chunk attention.
+                # For real_offload (CPU cache), fall back to current chunk only.
+                if self.device is None:
+                    return self.key_cache[layer_idx], self.value_cache[layer_idx]
+                else:
+                    return key_states, value_states
             else:
                 if layer_idx not in self.tail_k:
                     self.tail_k[layer_idx] = key_states
@@ -614,7 +648,12 @@ class OmniKVMoreEffCache(transformers.cache_utils.DynamicCache):
                 )
                 cpu_cache.set_prefilled_cache(_key, _value, layer_idx)
                 logger.info(f"L{layer_idx} offload to cpu {time.time() - st}")
-                return key_states, value_states
+                # Return accumulated cache for chunked prefill cross-chunk attention.
+                # For real_offload (CPU cache), fall back to current chunk only.
+                if self.device is None:
+                    return self.key_cache[layer_idx], self.value_cache[layer_idx]
+                else:
+                    return key_states, value_states
             else:
                 if layer_idx not in self.tail_k:
                     self.tail_k[layer_idx] = key_states
@@ -721,10 +760,23 @@ class DynamicBrutalOffloadCache(transformers.cache_utils.DynamicCache):
                 _value = value_states.to(device="cpu", non_blocking=True)
                 # _key = key_states
                 # _value = value_states
-                self.key_cache.append(_key)
-                self.value_cache.append(_value)
+                if len(self.key_cache) <= layer_idx:
+                    self.key_cache.append(_key)
+                    self.value_cache.append(_value)
+                else:
+                    self.key_cache[layer_idx] = torch.cat(
+                        [self.key_cache[layer_idx], _key], dim=-2
+                    )
+                    self.value_cache[layer_idx] = torch.cat(
+                        [self.value_cache[layer_idx], _value], dim=-2
+                    )
                 logger.info(f"L{layer_idx} offload to cpu {time.time() - st}")
-                return key_states, value_states
+                # Return accumulated cache for chunked prefill cross-chunk attention.
+                # For real_offload (CPU cache), fall back to current chunk only.
+                if self.device is None:
+                    return self.key_cache[layer_idx], self.value_cache[layer_idx]
+                else:
+                    return key_states, value_states
             else:
                 if layer_idx not in self.tail_k:
                     self.tail_k[layer_idx] = key_states

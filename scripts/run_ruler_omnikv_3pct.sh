@@ -3,7 +3,7 @@
 # Quick estimation run before full evaluation
 
 # ===================== Config =====================
-MODEL_PATH="/home/jheo/models/Qwen3-8B-128k"
+MODEL_PATH="/workspace/models/Qwen3-8B-128k"
 MODEL_TEMPLATE="qwen3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OMNIKV_DIR="$(dirname "$SCRIPT_DIR")"
@@ -13,8 +13,6 @@ CONFIG_PATH="configs/qwen3_8b_100k_ruler.json"
 NUM_SAMPLES=3
 # ==================================================
 
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate omnikv
 cd "${OMNIKV_DIR}"
 
 # Generate RULER data if not exists

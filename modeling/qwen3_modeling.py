@@ -20,15 +20,16 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2RotaryEmbedding,
     Qwen2MLP,
     Qwen2PreTrainedModel,
-    Qwen2FlashAttention2,
-    Qwen2SdpaAttention,
-    apply_rotary_pos_emb,
-    repeat_kv,
 )
+from modeling.patch_of_llama3_1 import ROPE_INIT_FUNCTIONS as _ROPE_INIT_FNS
+
 try:
     from transformers.models.qwen2.modeling_qwen2 import _get_unpad_data
 except ImportError:
-    from transformers.modeling_flash_attention_utils import _get_unpad_data
+    try:
+        from transformers.modeling_flash_attention_utils import _get_unpad_data
+    except ImportError:
+        _get_unpad_data = None
 
 try:
     from transformers.modeling_attn_mask_utils import (
@@ -37,6 +38,41 @@ try:
     )
 except ImportError:
     pass
+
+
+# ===================== RoPE helpers (self-contained, no transformers version dependency) =====================
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Apply rotary position embedding.
+    Handles both 2D cos/sin [seq_len, dim] (from PatchQwen2RotaryEmbedding)
+    and 3D cos/sin [batch, seq_len, dim] (from transformers >=4.45).
+    """
+    if position_ids is not None and cos.dim() == 2:
+        # 2D cos/sin from PatchQwen2RotaryEmbedding: index by position_ids
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    else:
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat KV heads to match query heads."""
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -57,6 +93,66 @@ class Qwen3Config(Qwen2Config):
             self.head_dim = head_dim
         else:
             self.head_dim = self.hidden_size // self.num_attention_heads
+
+
+# ===================== Patched RotaryEmbedding with rope_scaling =====================
+
+class PatchQwen2RotaryEmbedding(nn.Module):
+    """Qwen2-compatible RotaryEmbedding with rope_scaling support (YaRN, etc.).
+
+    Forward interface: (x, seq_len=N) -> (cos, sin)
+    Matches transformers 4.41.2 Qwen2RotaryEmbedding interface.
+    """
+
+    def __init__(self, dim=None, max_position_embeddings=2048, base=10000,
+                 device=None, config=None):
+        super().__init__()
+        self.rope_kwargs = {}
+        if config is None:
+            self.rope_kwargs = {
+                "rope_type": "default", "dim": dim, "base": base,
+                "max_position_embeddings": max_position_embeddings,
+            }
+            self.rope_type = "default"
+            self.max_seq_len_cached = max_position_embeddings
+        else:
+            if config.rope_scaling is not None:
+                self.rope_type = config.rope_scaling.get(
+                    "rope_type", config.rope_scaling.get("type", "default"))
+            else:
+                self.rope_type = "default"
+            self.max_seq_len_cached = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = _ROPE_INIT_FNS[self.rope_type]
+        inv_freq, self.attention_scaling = self.rope_init_fn(
+            self.config, device, **self.rope_kwargs)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(
+            self.max_seq_len_cached, device=device,
+            dtype=torch.get_default_dtype())
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=device, dtype=torch.int64).type_as(
+            self.inv_freq)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached",
+            (emb.cos() * self.attention_scaling).to(dtype), persistent=False)
+        self.register_buffer(
+            "sin_cached",
+            (emb.sin() * self.attention_scaling).to(dtype), persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x, seq_len=None):
+        if seq_len is not None and seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len, device=x.device, dtype=x.dtype)
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
 
 
 # ===================== Attention with Q/K Norm =====================
@@ -89,10 +185,12 @@ class Qwen3Attention(nn.Module):
         self.q_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.rotary_emb = Qwen2RotaryEmbedding(
-            self.head_dim,
+        # Always use PatchQwen2RotaryEmbedding for consistent (x, seq_len=N) interface
+        self.rotary_emb = PatchQwen2RotaryEmbedding(
+            dim=self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
+            config=config if getattr(config, 'rope_scaling', None) is not None else None,
         )
 
     def forward(

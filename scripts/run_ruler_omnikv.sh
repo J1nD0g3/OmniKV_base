@@ -3,7 +3,7 @@
 # 100k context, 10 tasks (niah_single_3 excluded)
 
 # ===================== Config =====================
-MODEL_PATH="/home/jheo/models/Qwen3-8B-128k"
+MODEL_PATH="/workspace/models/Qwen3-8B-128k"
 MODEL_TEMPLATE="qwen3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OMNIKV_DIR="$(dirname "$SCRIPT_DIR")"
@@ -12,8 +12,6 @@ RULER_TASKS="niah_single_1,niah_single_2,niah_multikey_1,niah_multikey_2,niah_mu
 CONFIG_PATH="configs/qwen3_8b_100k_ruler.json"
 # ==================================================
 
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate omnikv
 cd "${OMNIKV_DIR}"
 
 # Generate RULER data if not exists
@@ -34,7 +32,7 @@ if [ "$MISSING" -eq 1 ]; then
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_DIR="$HOME/OmniKV_base/logs/ruler_${TIMESTAMP}"
+LOG_DIR="${OMNIKV_DIR}/logs/ruler_${TIMESTAMP}"
 mkdir -p "$LOG_DIR"
 
 echo "=== RULER OmniKV ===" | tee "$LOG_DIR/run.log"

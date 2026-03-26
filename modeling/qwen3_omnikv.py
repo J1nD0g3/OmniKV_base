@@ -4,7 +4,6 @@ Mirrors modeling/omnikv.py but uses Qwen3 base classes.
 """
 import math
 import time
-import infer as _infer_module
 
 import torch
 import torch.nn as nn
@@ -240,6 +239,7 @@ class Qwen3OmniKVMulLayer(Qwen3DecoderLayer):
                 raise ValueError("不支持dense_more=False")
             # Record selected KV count on first select layer
             if self.layer_idx == self.do_select_layers[0]:
+                import infer as _infer_module
                 _infer_module.last_inference_meta["num_selected_kv"] = idx.shape[-1]
             past_key_value.stage = "decoding"
             self.decode_step += 1
@@ -323,6 +323,12 @@ class Qwen3OmniKVMulLM(Qwen3ForCausalLM):
         if not isinstance(past_key_values, Cache):
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
         if not isinstance(past_key_values, self.cache_cls):
+            # Reset per-layer state for new generation
+            for layer in self.model.layers:
+                if hasattr(layer, 'prefill_len'):
+                    layer.prefill_len = None
+                    layer.decode_step = 0
+                    layer.hidden_state_window = None
             kwargs = {}
             if (cache_cls_name := self.config.get("cache_cls", "default")) == "multi" or cache_cls_name == "without_pack":
                 do_sel_layers = [int(i) for i in self.config.get("do_select_layers").split(",")]
