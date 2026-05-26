@@ -152,3 +152,29 @@ def qa_f1_zh_score(prediction, ground_truth, **kwargs):
     prediction_tokens = [token for token in prediction_tokens if len(token) > 0]
     ground_truth_tokens = [token for token in ground_truth_tokens if len(token) > 0]
     return f1_score(prediction_tokens, ground_truth_tokens)
+
+
+# ============================================================
+# LongBench-v2 metrics
+# ============================================================
+
+def longbenchv2_extract_answer(result):
+    """Extract A/B/C/D answer from model output."""
+    result = result.replace('*', '')
+    match = re.search(r'The correct answer is \(([A-D])\)', result)
+    if match:
+        return match.group(1)
+    match = re.search(r'The correct answer is ([A-D])', result)
+    if match:
+        return match.group(1)
+    # Fallback: find last standalone A/B/C/D
+    match = re.findall(r'\b([A-D])\b', result)
+    if match:
+        return match[-1]
+    return None
+
+
+def longbenchv2_accuracy(prediction, ground_truth, **kwargs):
+    """LongBench-v2 accuracy metric (exact match on A/B/C/D)."""
+    pred_answer = longbenchv2_extract_answer(prediction)
+    return 1.0 if pred_answer == ground_truth else 0.0
